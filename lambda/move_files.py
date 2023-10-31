@@ -26,7 +26,7 @@ parser.add_argument(
     '--limit',
     type=int,
     required=False,
-    default=1,
+    default=5,
     help="""
     How many to limit the move to,
     more for when you are not passing
