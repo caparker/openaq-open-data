@@ -2,9 +2,7 @@ import logging
 import os
 import csv
 import gzip
-import re
 
-from multiprocessing import Process, Pool
 from open_data_export.pgdb import DB
 from open_data_export.config import settings
 from smart_open import open
@@ -207,8 +205,7 @@ def object_exists(Bucket: str, Key: str):
     return exists
 
 
-def copy_object(from_location, to_location, delete=False):
-    logger.debug(f"moving {from_location['Bucket']}/{from_location['Key']}\n to {to_location['Bucket']}/{to_location['Key']}")
+def move_object(from_location, to_location):
     try:
         if (to_location['Bucket'] != from_location['Bucket'] or to_location['Key'] != from_location['Key']):
             s3.copy_object(
@@ -221,12 +218,11 @@ def copy_object(from_location, to_location, delete=False):
                 },
             )
             logger.debug(f"Copied: {to_location['Bucket']}/{to_location['Key']}")
-            if delete:
-                s3.delete_object(
-                Bucket=from_location['Bucket'],
-                Key=from_location['Key'],
-                )
-                logger.debug(f"Deleted: {from_location['Bucket']}/{from_location['Key']}")
+            s3.delete_object(
+               Bucket=from_location['Bucket'],
+               Key=from_location['Key'],
+            )
+            logger.debug(f"Deleted: {from_location['Bucket']}/{from_location['Key']}")
         else:
             # if its the same lets just update the ACL policy
             s3.put_object_acl(
@@ -257,7 +253,7 @@ def copy_object(from_location, to_location, delete=False):
 def move_objects_handler(event, context=None):
     start = time.time()
     db = get_database()
-    limit = 2
+    limit = 5000
     where = "exported_on IS NOT NULL"
     # AND (l.metadata->>'move' IS NOT NULL AND (l.metadata->>'move')::boolean = true)
     args = {}
@@ -273,15 +269,6 @@ def move_objects_handler(event, context=None):
         args['node'] = event['node']
         where += " AND l.sensor_nodes_id = :node"
 
-    where = """
-			COALESCE(key, l.metadata->>'Key') IS NOT NULL
-			AND COALESCE(key, l.metadata->>'Key') ~* :pattern
-			AND l.exported_on IS NOT NULL
-			AND l.records > :records
-			"""
-
-    args = { "records": 0, "pattern": "/provider" }
-
     # determine the extension type
     if settings.WRITE_FILE_FORMAT == 'csv':
         ext = 'csv'
@@ -296,41 +283,50 @@ def move_objects_handler(event, context=None):
 
     # where = " AND l.metadata->>'Bucket' IS NOT NULL"
 
-    days, time_ms = db.rows(
+    days = db.rows(
         f"""
         WITH days AS (
         -----------
         -- get a set of files to move
         -----------
-         SELECT
+        SELECT
           l.day
         , l.sensor_nodes_id
-        , COALESCE(l.key, l.metadata->>'Key') as from_key
-        , FORMAT('records/csv.gz/country=%%s/locationid=%%s/year=%%s/month=%%s/location-%%s-%%s.{ext}'
-          , lower(COALESCE(c.iso, 'no-country'))
+        , lower(COALESCE(sn.country, 'no-country')) as country
+        , p.export_prefix
+        , l.open_data_export_logs_id
+        , FORMAT('records/{ext}/provider=%%s/country=%%s/locationid=%%s/year=%%s/month=%%s/location-%%s-%%s.{ext}'
+          , p.export_prefix
+          , lower(COALESCE(sn.country, 'no-country'))
           , l.sensor_nodes_id
           , to_char(l.day, 'YYYY')
           , to_char(l.day, 'MM')
           , l.sensor_nodes_id
           , to_char(l.day, 'YYYYMMDD')
-        ) as to_key
+        ) as key
+        , l.metadata->>'Key' as current_key
+        , l.metadata->>'error' as current_error
+        , l.metadata->>'message' as current_error_message
         FROM open_data_export_logs l
         JOIN sensor_nodes sn ON (l.sensor_nodes_id = sn.sensor_nodes_id)
-        JOIN countries c ON (sn.countries_id = c.countries_id)
+        JOIN providers p ON (sn.source_name = p.source_name)
         WHERE {where}
         LIMIT {limit})
         -----------
         -- Update those records and return data
         -----------
         UPDATE open_data_export_logs
-        SET key = 's3://{settings.OPEN_DATA_BUCKET}/'||to_key
-          , metadata = jsonb_build_object(
-           'moved_on', now(),
-           'moved_from', from_key
+        SET metadata = COALESCE(metadata::jsonb, '{{}}'::jsonb)
+        ||jsonb_build_object(
+           'Bucket', '{settings.OPEN_DATA_BUCKET}'
+          ,'Key', key
+          ,'move', false
+          ,'error', false
+          ,'message', 'no error'
         )
         FROM days
-        WHERE days.sensor_nodes_id=open_data_export_logs.sensor_nodes_id
-        AND days.day=open_data_export_logs.day
+        WHERE days.open_data_export_logs_id =
+              open_data_export_logs.open_data_export_logs_id
         -----------
         -- return the pre-update data
         -----------
@@ -338,40 +334,41 @@ def move_objects_handler(event, context=None):
         """, **args)
 
     successes = 0
-    regex = re.compile('s3://[a-z-]+/', re.IGNORECASE)
     for row in days:
-        logger.debug(row)
-        day = row[0]
+
         node = row[1]
-        from_key = row[2]
-        to_key = row[3]
+        country = row[2]
+        day = row[0]
+        key = row[5]
+        old_key = row[6]
 
         yr = day.strftime('%Y')
         mn = day.strftime('%m')
         dy = day.strftime('%d')
 
-        try:
-            # make sure that we have the extension on the from_key
-            if not from_key.endswith(ext):
-                from_key = f"{from_key}.{ext}"
+        if row[7] is not None:
+            logger.debug(f"Previous error: {row[8]}")
 
-            copy_object(
+        # if old_key is None:
+        old_key = f"""records/{settings.WRITE_FILE_FORMAT}/country={country}/locationid={node}/year={yr}/month={mn}/location-{node}-{yr}{mn}{dy}.{ext}"""
+
+        try:
+            move_object(
                 from_location={
                     "Bucket": settings.OPEN_DATA_BUCKET,
-                    "Key": regex.sub('', from_key),
+                    "Key": old_key,
                 },
                 to_location={
                     "Bucket": settings.OPEN_DATA_BUCKET,
-                    "Key": to_key,
-                },
-				delete=False
+                    "Key": key,
+                }
             )
             successes += 1
         except Exception as e:
-            submit_move_error(day, node, from_key, f"{e}")
+            submit_error(day, node, f"{e}")
 
     sec = time.time() - start
-    logger.info(f'Moved {successes} files (of {len(days)}) in {sec} seconds (query: {time_ms/1000})')
+    logger.info(f'Moved {successes} files (of {len(days)}) in {sec} seconds')
 
 
 def update_hourly_data(ts):
@@ -451,27 +448,6 @@ def submit_error(day: str, node: int, error: str):
     logger.error(f"error: {node} on {day} - {error}")
     db = get_database()
     return db.rows(sql, day=day, node=node, error=error)
-
-def submit_move_error(day: str, node: int, key: str, error: str):
-    """
-    Mark the location/day with an error message and revert the key
-    """
-    if isinstance(day, str):
-        day = datetime.fromisoformat(day).date()
-    sql = """
-    UPDATE open_data_export_logs
-    SET key = :key
-	, metadata = (COALESCE(metadata::jsonb, '{}'::jsonb)||jsonb_build_object(
-      'error', true
-    , 'message', (:error)::text
-    , 'at', current_timestamp::text
-    ))::json
-    WHERE day = :day AND sensor_nodes_id = :node
-    RETURNING TRUE
-    """
-    logger.error(f"error: {node} on {day} - {error}")
-    db = get_database()
-    return db.rows(sql, day=day, node=node, key=key, error=error)
 
 
 def get_all_location_days():
@@ -772,13 +748,6 @@ def export_data(day, node):
     except Exception as e:
         submit_error(day, node, str(e))
 
-def export_data_mp(p):
-    logger.info(f"Starting {p[0]}/{p[1]} on pid: {os.getpid()}")
-    try:
-        n, sec = export_data(p[1], p[0])
-    except Exception as e:
-        sec = -1
-    return sec
 
 def export_pending():
     """
@@ -787,10 +756,12 @@ def export_pending():
     """
     start = time.time()
     days, time_ms = get_pending_location_days()
-
-    pool = Pool()
-    result = pool.map(export_data_mp, days)
-    pool.close()
+    for d in days:
+        try:
+            logger.debug(f"{d[1]}/{d[0]}")
+            export_data(day=d[1], node=d[0])
+        except Exception as e:
+            logger.warning(f"Error processing {d[0]}-{d[1]}: {e}")
 
     logger.info(
         "export_pending: %s; seconds: %0.4f;",
@@ -809,7 +780,7 @@ def update_outdated_handler(event=None, context=None):
     if context is not None:
         time_available = context.get_remaining_time_in_millis()/1000
     else:
-        time_available = 80  # basically do it onceq
+        time_available = 80  # basically do it once
 
     time_left = time_available
     days = 0
